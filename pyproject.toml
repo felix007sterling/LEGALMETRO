@@ -23,6 +23,7 @@ dependencies = [
     "sqlalchemy>=2.0.52",
     "tzdata>=2026.3",
     "uvicorn>=0.52.4",
+    "cloudinary"
 ]
 
 [tool.pytest.ini_options]
