@@ -2,6 +2,7 @@
 
 Phase 5+ — FastAPI Foundation with authentication, RBAC, products,
 inspections, and analysis endpoints.
+
 Exposes:
 - GET /health
 - GET /api/v1/health
@@ -20,23 +21,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.api import system, analysis, auth, products, inspections
 
+
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: pre-heat the OCR reader so the first analysis does not pay
-    the one-time EasyOCR model-loading cost. This keeps subsequent inspections
-    fast while preserving accuracy. Fails gracefully if OCR is unavailable."""
-    try:
-        from app.services.ocr import engine as ocr_engine
-        logger.info("Pre-loading OCR engine…")
-        ocr_engine._get_reader()
-        logger.info("OCR engine ready.")
-    except Exception as exc:  # pragma: no cover - startup only
-        logger.warning("OCR pre-heat skipped: %s", exc)
+    """Application startup/shutdown lifecycle.
+
+    EasyOCR is intentionally NOT pre-loaded during startup because
+    EasyOCR/PyTorch requires significant memory. The OCR reader is
+    loaded lazily when the first OCR request is processed.
+    """
+    logger.info("Application starting...")
     yield
+    logger.info("Application shutting down...")
 
 
 app = FastAPI(
@@ -50,6 +50,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
 # CORS for local React frontend
 app.add_middleware(
     CORSMiddleware,
@@ -58,6 +59,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # API v1 routers
 api_v1_router = system.router
@@ -70,7 +72,11 @@ inspections_router = inspections.router
 @app.get("/health", tags=["system"], summary="Root health check")
 def root_health():
     """Alias for compatibility — returns simple JSON."""
-    return {"status": "ok", "app": settings.APP_NAME, "version": settings.APP_VERSION}
+    return {
+        "status": "ok",
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+    }
 
 
 @app.get("/api/v1", tags=["system"], summary="API v1 root")
@@ -91,16 +97,31 @@ def api_v1_root():
 
 
 # Mount system router under /api/v1
-app.include_router(api_v1_router, prefix=settings.API_V1_PREFIX)
+app.include_router(
+    api_v1_router,
+    prefix=settings.API_V1_PREFIX,
+)
 
 # Mount analysis router under /api/v1
-app.include_router(analysis_router, prefix=settings.API_V1_PREFIX)
+app.include_router(
+    analysis_router,
+    prefix=settings.API_V1_PREFIX,
+)
 
 # Mount auth router under /api/v1
-app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
+app.include_router(
+    auth_router,
+    prefix=settings.API_V1_PREFIX,
+)
 
 # Mount products router under /api/v1
-app.include_router(products_router, prefix=settings.API_V1_PREFIX)
+app.include_router(
+    products_router,
+    prefix=settings.API_V1_PREFIX,
+)
 
 # Mount inspections router under /api/v1
-app.include_router(inspections_router, prefix=settings.API_V1_PREFIX)
+app.include_router(
+    inspections_router,
+    prefix=settings.API_V1_PREFIX,
+)
