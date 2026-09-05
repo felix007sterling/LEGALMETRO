@@ -27,8 +27,8 @@ import time
 from dataclasses import dataclass, field
 
 import cv2
+import httpx
 import numpy as np
-import requests
 
 from app.core.config import get_settings
 from app.services.image_service import ImageVariant
@@ -107,7 +107,7 @@ def _encode_jpeg(image: np.ndarray) -> bytes:
 
 def _call_ocr_space(image_bytes: bytes, api_key: str) -> dict:
     """POST the image to OCR.space and return the parsed JSON payload."""
-    response = requests.post(
+    response = httpx.post(
         OCR_SPACE_URL,
         files={"file": ("label.jpg", image_bytes, "image/jpeg")},
         data={
