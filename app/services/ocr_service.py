@@ -1,4 +1,4 @@
-"""OCR service based on EasyOCR with multi-variant fusion.
+"""OCR service based on the OCR.space cloud API.
 
 OCR is treated strictly as EVIDENCE EXTRACTION, never as a compliance
 decision maker. This service:
@@ -6,15 +6,19 @@ decision maker. This service:
 1. Receives a PreprocessedImage (or raw numpy array) holding several OpenCV
    "variants" of the same image (clean grayscale, CLAHE contrast-enhanced,
    upscaled, deskewed, Otsu-binarized, inverted).
-2. Runs EasyOCR over the best few variants with configured language + GPU.
-3. Fuses the per-region results: for each text line it keeps the highest
-   confidence reading, so whichever variant read a region best wins.
-4. Normalizes output into structured blocks:
+2. Encodes the single best variant to JPEG bytes and posts it to the
+   OCR.space REST API (OCREngine=2, overlay enabled for word-level boxes).
+3. Normalizes the response into the same structured blocks the rest of the
+   pipeline already expects:
    - text, confidence, bounding box (x, y, w, h)
-5. Computes an aggregate confidence score for the image.
+4. Computes an aggregate confidence score for the image.
 
-EasyOCR is a heavy model. It is loaded lazily and cached as a module-level
-singleton so repeated calls do not reload the model.
+Why only one HTTP call per image (not the old multi-variant EasyOCR fusion):
+OCR.space's free tier is rate-limited and size-limited (~1MB/request), and
+each variant would cost a separate network round trip. OCR.space also does
+its own internal preprocessing, so a single well-chosen variant is enough —
+this trades a little of the old multi-variant fusion accuracy for something
+that actually fits a free-tier deployment's memory and quota budget.
 
 No legal logic lives here.
 """
@@ -22,10 +26,24 @@ No legal logic lives here.
 import time
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
+import requests
 
 from app.core.config import get_settings
 from app.services.image_service import ImageVariant
+
+OCR_SPACE_URL = "https://apipro1.ocr.space/parse/image"
+# Preference order for picking which single variant to send — OCR.space does
+# its own thresholding/contrast work internally, so a clean grayscale (or
+# CLAHE-enhanced) baseline tends to read best without extra local work.
+_VARIANT_PRIORITY = ["clahe", "gray", "upscaled", "deskew", "otsu", "invert"]
+
+# A conservative default confidence for successfully parsed text: OCR.space's
+# free tier does not return a numeric per-word confidence score, so callers
+# downstream that filter on OCR_MIN_CONFIDENCE need a stand-in value that
+# reliably clears that threshold for genuinely recognized text.
+_DEFAULT_CONFIDENCE = 0.85
 
 
 @dataclass
@@ -46,35 +64,17 @@ class OCRResult:
     lenient_text: str = ""
     confidence_score: float = 0.0
     processing_time_ms: int = 0
-    engine: str = "easyocr"
+    engine: str = "ocrspace"
     steps_applied: list[str] = field(default_factory=list)
 
 
-_reader = None
-
-# Preference order for picking which variants to actually run OCR on.
-_VARIANT_PRIORITY = ["gray", "clahe", "upscaled", "deskew", "otsu", "invert"]
-# Keep the runtime bounded: run EasyOCR on at most this many variants.
-MAX_OCR_PASSES = 3
-
-
-def _get_reader():
-    """Lazily instantiate and cache the EasyOCR reader."""
-    global _reader
-    if _reader is None:
-        settings = get_settings()
-        import easyocr
-
-        _reader = easyocr.Reader(
-            settings.OCR_LANGUAGE,
-            gpu=settings.OCR_GPU,
-            verbose=False,
-        )
-    return _reader
+class OCRSpaceError(Exception):
+    """Raised when the OCR.space API call fails or returns an error payload."""
 
 
 def normalize_bbox(points) -> list[int]:
-    """Convert EasyOCR's 4-corner polygon into [x, y, w, h]."""
+    """Convert a 4-corner polygon into [x, y, w, h]. Kept for compatibility
+    with any callers still passing polygon-style coordinates."""
     if not points:
         return [0, 0, 0, 0]
     xs = [int(round(p[0])) for p in points]
@@ -86,166 +86,103 @@ def normalize_bbox(points) -> list[int]:
     return [x, y, w, h]
 
 
-def _pick_variants(processed) -> list:
-    """Choose up to MAX_OCR_PASSES variants to run OCR on, baseline first."""
+def _pick_variant(processed):
+    """Choose the single best variant to send to OCR.space."""
     variants = list(getattr(processed, "variants", None) or [])
     if not variants:
         # Backward compat: caller passed a raw grayscale image.
-        variants = [ImageVariant("gray", np.asarray(processed))]
+        return ImageVariant("gray", np.asarray(processed))
     order = {name: i for i, name in enumerate(_VARIANT_PRIORITY)}
     variants.sort(key=lambda v: order.get(v.name, 99))
-    # Ensure the clean grayscale baseline is always first if available.
-    base = next((v for v in variants if v.name == "gray"), variants[0])
-    rest = [v for v in variants if v is not base]
-    selected = [base] + rest[: MAX_OCR_PASSES - 1]
-    return selected
+    return variants[0]
 
 
-def _run_pass(reader, image: np.ndarray):
-    """Run EasyOCR once and return raw items, plus pixel scale metadata."""
-    return reader.readtext(image)
+def _encode_jpeg(image: np.ndarray) -> bytes:
+    """Encode a numpy image array to JPEG bytes for upload."""
+    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        raise OCRSpaceError("Failed to encode image for OCR.space upload")
+    return buf.tobytes()
 
 
-def _merge_results(per_variant, baseline_shape, min_conf):
-    """Fuse per-variant OCR detections into a single reading.
-
-    Strategy: normalize every block's coordinates to the baseline image
-    coordinate system, cluster them into visual lines, and within each line
-    drop overlapping duplicates keeping the highest-confidence text. This way
-    whichever variant read a given region best contributes to the final text.
-    """
-    base_h, base_w = baseline_shape[:2]
-    band_tol = max(12, int(base_h * 0.018))
-
-    # Normalized records with coordinates scaled back to baseline space.
-    records = []
-    for variant_result in per_variant:
-        scale_x = base_w / variant_result["width"]
-        scale_y = base_h / variant_result["height"]
-        for item in variant_result["items"]:
-            points, text, conf = item
-            x, y, w, h = normalize_bbox(points)
-            records.append(
-                {
-                    "text": str(text).strip(),
-                    "conf": float(conf),
-                    "x": int(x * scale_x),
-                    "y": int(y * scale_y),
-                    "w": int(w * scale_x),
-                    "h": int(h * scale_y),
-                    "yc": int(y * scale_y) + int(h * scale_y) // 2,
-                }
-            )
-
-    records = [r for r in records if r["text"]]
-    records.sort(key=lambda r: (r["yc"], r["x"]))
-
-    # Cluster into lines.
-    lines = []
-    for r in records:
-        placed = False
-        for line in lines:
-            if abs(r["yc"] - line[0]["yc"]) <= band_tol:
-                line.append(r)
-                placed = True
-                break
-        if not placed:
-            lines.append([r])
-
-    # Within each line, drop horizontally-overlapping duplicates (keep best).
-    def h_overlap(a, b):
-        a_l, a_r = a["x"], a["x"] + a["w"]
-        b_l, b_r = b["x"], b["x"] + b["w"]
-        inter = max(0, min(a_r, b_r) - max(a_l, b_l))
-        shorter = min(a["w"], b["w"]) or 1
-        return (inter / shorter) > 0.3
-
-    final_lines = []
-    for line in lines:
-        line = sorted(line, key=lambda r: r["x"])
-        kept = []
-        for r in line:
-            dup = next((k for k in kept if h_overlap(k, r)), None)
-            if dup is not None:
-                if r["conf"] > dup["conf"]:
-                    kept[kept.index(dup)] = r
-            else:
-                kept.append(r)
-        kept.sort(key=lambda r: r["x"])
-        final_lines.append(kept)
-
-    blocks: list[OCRBlock] = []
-    for line in final_lines:
-        for r in line:
-            blocks.append(
-                OCRBlock(
-                    text=r["text"],
-                    confidence=r["conf"],
-                    bbox=[r["x"], r["y"], r["w"], r["h"]],
-                )
-            )
-
-    # Text passes: confident-only and lenient (every readable token).
-    confident_lines = []
-    lenient_lines = []
-    for line in final_lines:
-        conf_ok = [r for r in line if r["conf"] >= min_conf]
-        if conf_ok:
-            confident_lines.append(" ".join(r["text"] for r in conf_ok))
-        lenient_lines.append(" ".join(r["text"] for r in line))
-
-    raw_text = "\n".join(confident_lines)
-    lenient_text = "\n".join(lenient_lines)
-
-    confident_blocks = [b for b in blocks if b.confidence >= min_conf]
-    score = (
-        sum(b.confidence for b in confident_blocks) / len(confident_blocks)
-        if confident_blocks
-        else 0.0
+def _call_ocr_space(image_bytes: bytes, api_key: str) -> dict:
+    """POST the image to OCR.space and return the parsed JSON payload."""
+    response = requests.post(
+        OCR_SPACE_URL,
+        files={"file": ("label.jpg", image_bytes, "image/jpeg")},
+        data={
+            "apikey": api_key,
+            "language": "eng",
+            "OCREngine": 2,
+            "isOverlayRequired": True,
+            "scale": True,
+            "detectOrientation": True,
+        },
+        timeout=30,
     )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("IsErroredOnProcessing"):
+        message = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "Unknown OCR.space error"
+        if isinstance(message, list):
+            message = "; ".join(message)
+        raise OCRSpaceError(message)
+    return payload
 
-    return blocks, raw_text, lenient_text, score
+
+def _blocks_from_payload(payload: dict) -> list[OCRBlock]:
+    """Flatten OCR.space's overlay (Lines -> Words) into OCRBlock objects."""
+    blocks: list[OCRBlock] = []
+    results = payload.get("ParsedResults") or []
+    if not results:
+        return blocks
+    overlay = results[0].get("TextOverlay") or {}
+    for line in overlay.get("Lines", []) or []:
+        for w in line.get("Words", []) or []:
+            text = (w.get("WordText") or "").strip()
+            if not text:
+                continue
+            x = int(w.get("Left", 0))
+            y = int(w.get("Top", 0))
+            width = int(w.get("Width", 0))
+            height = int(w.get("Height", 0))
+            blocks.append(
+                OCRBlock(text=text, confidence=_DEFAULT_CONFIDENCE, bbox=[x, y, width, height])
+            )
+    return blocks
 
 
 def run_ocr(image_data, steps_applied: list[str] | None = None) -> OCRResult:
-    """Run EasyOCR across the best image variants and fuse the result.
+    """Send one image variant to OCR.space and normalize the result.
 
     image_data: a PreprocessedImage (preferred) or a plain grayscale numpy
-    array for backward compatibility.
-
-    Returns a normalized OCRResult.
+    array for backward compatibility. Signature is unchanged from the
+    previous EasyOCR-based implementation so callers (ocr_pipeline.py /
+    engine.py) need no changes.
     """
-    reader = _get_reader()
+    settings = get_settings()
+    api_key = getattr(settings, "OCR_SPACE_API_KEY", "") or ""
+    if not api_key:
+        raise OCRSpaceError(
+            "OCR_SPACE_API_KEY is not configured — set it in the environment"
+        )
+
     start = time.perf_counter()
 
-    settings = get_settings()
-    min_conf = settings.OCR_MIN_CONFIDENCE
+    variant = _pick_variant(image_data)
+    image_bytes = _encode_jpeg(np.asarray(variant.image))
 
-    if hasattr(image_data, "variants"):
-        pre = image_data
-        baseline = getattr(pre, "grayscale", None)
-        baseline_shape = baseline.shape if baseline is not None else next(
-            (v.image.shape for v in getattr(pre, "variants", [])), (0, 0)
-        )
-    else:
-        baseline_shape = np.asarray(image_data).shape
+    payload = _call_ocr_space(image_bytes, api_key)
 
-    selected = _pick_variants(image_data)
+    results = payload.get("ParsedResults") or []
+    raw_text = (results[0].get("ParsedText") or "").strip() if results else ""
+    blocks = _blocks_from_payload(payload)
 
-    per_variant = []
-    for v in selected:
-        img = np.asarray(v.image)
-        items = _run_pass(reader, img)
-        per_variant.append(
-            {
-                "items": items,
-                "width": img.shape[1],
-                "height": img.shape[0],
-            }
-        )
-
-    blocks, raw_text, lenient_text, confidence_score = _merge_results(
-        per_variant, baseline_shape, min_conf
+    confident_blocks = [b for b in blocks if b.confidence >= settings.OCR_MIN_CONFIDENCE]
+    confidence_score = (
+        sum(b.confidence for b in confident_blocks) / len(confident_blocks)
+        if confident_blocks
+        else (_DEFAULT_CONFIDENCE if raw_text else 0.0)
     )
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -253,8 +190,9 @@ def run_ocr(image_data, steps_applied: list[str] | None = None) -> OCRResult:
     return OCRResult(
         blocks=blocks,
         raw_text=raw_text,
-        lenient_text=lenient_text,
+        lenient_text=raw_text,
         confidence_score=round(confidence_score, 4),
         processing_time_ms=elapsed_ms,
+        engine="ocrspace",
         steps_applied=list(steps_applied or []),
     )
