@@ -50,7 +50,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
+@app.get("/", tags=["system"], summary="Root endpoint")
+def root():
+    return {       
+        "HAI PREM": "success",       
+    }
 # CORS for local React frontend
 app.add_middleware(
     CORSMiddleware,
