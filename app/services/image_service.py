@@ -229,10 +229,28 @@ def download_image_bytes(file_path: str) -> bytes:
 
 
 def decode_to_cv2(data: bytes) -> np.ndarray:
-    """Decode image bytes into an OpenCV BGR image."""
+    """Decode image bytes into an OpenCV BGR image.
 
+    Uses PIL's JPEG "draft" mode to decode directly at a reduced scale when
+    possible (JPEG's native DCT scaling), instead of always fully decoding
+    at original resolution and only downsizing afterward. This caps peak
+    memory for large phone-camera photos (which can otherwise decode into a
+    70-150MB+ raw array before any resize ever happens) — the single
+    biggest real-world OOM risk on a 512MB host.
+    """
     try:
+        settings = get_settings()
+        target_dim = getattr(settings, "OCR_MAX_IMAGE_DIM", 1000)
+
         img = Image.open(io.BytesIO(data))
+        # draft() only works for JPEG and only shrinks (never enlarges);
+        # it's a no-op for PNG/other formats, which is fine — those are
+        # rarely as large as unprocessed camera JPEGs.
+        try:
+            img.draft("RGB", (target_dim, target_dim))
+        except Exception:
+            pass  # non-JPEG or draft unsupported — fall through to normal decode
+
         img = ImageOps.exif_transpose(img)
         rgb = np.array(img.convert("RGB"))
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -241,7 +259,6 @@ def decode_to_cv2(data: bytes) -> np.ndarray:
         raise ImageValidationError(
             f"Cannot decode image: {exc}"
         ) from exc
-
 
 def ensure_upload_dir(analysis_id: str) -> Path:
     """Create and return the upload directory.
