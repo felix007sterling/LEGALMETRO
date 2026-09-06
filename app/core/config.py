@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     REPORT_DIR: Path = Path("reports")
 
     # Maximum size of an uploaded image
-    MAX_UPLOAD_SIZE_MB: int = 100
+    MAX_UPLOAD_SIZE_MB: int = 8
 
     # Allowed image formats
     #
